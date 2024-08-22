@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# command: compress-and-move 'phone/Internal storage' output_dir
+# output : output_dir/compressed_files
+
+default_internal_storage='./Internal storage'
+default_output='/mnt/0B310F8F0B310F8F/media/photos'
+internal_storage=$1
+output_dir=$2
+echo "
+               ========== COMPRESS and MOVE ==========
+This program's going to get all media files of a phone's 'Internal storage'
+then compress and move to the output-directory
+----------------------------------------------------------------------
+Command: compress-and-move 'phone/Internal storage' output_dir
+Output : output_dir/compressed_files
+
+Default internal storage: '$default_internal_storage' Use '_' to skip phone-directory input
+Default output: '$default_output'
+"
+
+
+# get input values
+if [ "$internal_storage" = '' ] || [ "$internal_storage" = '_' ]
+then
+	internal_storage=$default_internal_storage
+fi
+[ "$output_dir" = '' ] && output_dir=$default_output
+
+
+# validate input values
+## check if the directories exist
+if [ "$(basename "$internal_storage")" != 'Internal storage' ]
+then
+	echo "ERROR: the first argument must be a phone's 'Internal storage'"
+	exit 1
+fi
+check-dir-exists () {
+	if [ ! -d "$1" ]
+	then
+		echo "ERROR: no such directory $1"
+		exit 1
+	fi
+}
+check-dir-exists "$internal_storage"
+[ ! -d "$output_dir" ] && mkdir "$output_dir" -p
+check-dir-exists "$output_dir"
+
+## check pemissions of the directories
+check-read-write-permission (){
+	if [ ! -r "$1" ] || [ ! -w "$1" ]
+	then
+		echo "ERROR: permission denied: $1"
+		exit 1
+	fi
+}
+check-read-write-permission "$internal_storage"
+check-read-write-permission "$output_dir"
+
+
+# install dependencies
+## install required apt packages
+apt_packages="ffmpeg"
+error=0
+
+echo "===== Install dependencies =====
+Install the following packages: $apt_packages"
+for package in $apt_packages
+do
+	echo '-----'
+	dpkg-query -W --showformat='${_}' $package # check if the package was installed
+	if [ $? -ne 0 ]
+	then
+		sudo apt install $package -y -qq -q
+		if [ $? -ne 0 ]
+		then
+			echo "error: failed to install $package"
+			error=1
+			continue
+		fi
+	fi
+	echo "Installed: $package"
+done
+[ $error -eq 1 ] && exit 1
+echo -e "\nSuccesfulIly installed dependencies"
+
+
+# test ffmpeg
+tmp_dir="$output_dir/tmp_videos"
+mkdir "$tmp_dir" -p
+echo -e '\n===== Testing ====='
+
+## test if ffmpeg is executable
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc=duration=10:size=1280x720:rate=30 "$tmp_dir/testsrc.mp4"
+if [ $? -eq 0 ]
+then
+	echo 'ffmpeg is executable'
+else
+	rm -d -r "$tmp_dir"
+	exit 1;
+fi
+
+## use gpu accelerate ffmpeg or normal ffmpeg
+## ffmpeg_status defines which type of ffmpeg to execute. If nothing is appropriate then exits
+ffmpeg -hide_banner -loglevel panic -hwaccel cuda -hwaccel_output_format cuda -y \
+			-i "$tmp_dir/testsrc.mp4"  -c:v h264_nvenc -b:v 3M \
+			"$tmp_dir/output.mp4"
+if [ $? -eq 0 ]
+then
+	ffmpeg_status='gpu-accel'
+else
+	ffmpeg -hide_banner -loglevel error -y \
+                         -i "$tmp_dir/testsrc.mp4" -b:v 3M \
+                         "$tmp_dir/output.mp4"
+	if [ $? -eq 0 ]
+	then
+		ffmpeg_status='normal'
+	else
+		rm -d -r "$tmp_dir"
+		exit 1;
+	fi
+
+fi
+
+## if ffmpeg_status is gpu-accel, the program will use gpu to accelerate the render process
+## otherwise it will use cpu to render. CPU rendering is very slow.
+if [ "$ffmpeg_status" = "gpu-accel" ]
+then
+	echo "Uses GPU to render. Render processes won't take long"
+	use-ffmpeg(){
+	 usage: use-ffmpeg input_video output_video
+		input_video=$1
+		output_video=$2
+
+		ffmpeg -hide_banner -loglevel error -hwaccel cuda -y \
+				 -i "$input_video" -c:v h264_nvenc -b:v 3M \
+				 "$output_video"
+		return $?
+	}
+else
+	echo 'Uses CPU to render: Render processes will take long time. If possible, please use gpu acceleration'
+	use-ffmpeg(){
+	# usage: use-ffmpeg input_video output_video
+		input_video=$1
+		output_video=$2
+
+		ffmpeg -hide_banner -loglevel error -y \
+				 -i "$input_video" -b:v 3M \
+				 "$output_video"
+		return $?
+	}
+fi
+
+
+# MAIN PART
+processing() {
+# The processing function displays a spinning icon while waiting a process to complete.
+# The function's exit code is the exit code of the process
+# Usage: ( commands ) & processing 'please_wait_string'
+# ( sleep 3; exit 1) & processing 'ffmpeg is running'
+	echo $@
+	delay=.1
+
+	tput cnorm
+	pid=$!;  spin='-\|/'; i=0
+	while kill -0 $pid 2>/dev/null
+	do
+	  i=$(( (i+1) %4 ))
+	  printf "\r${spin:$i:1}"
+	  sleep $delay
+	done
+	printf "\r"
+	tput reset
+
+	return $(wait $pid)
+}
+
+
+to-created-date-name (){
+# usage: to-created-date-name file
+# output: return created_date_name which is the date the file was created
+	[ ! -f "$1" ] && exit 1;
+	# analyze the file
+	file_path="$1"
+	file_name=$(basename "$file_path")
+	if [ "$(echo "$file_name" | grep '\.')" = '' ] # if file_name doesn't have an extension then extension is blank
+	then
+		extension=''
+	else
+		extension=".${file_name##*.}"
+	fi
+	
+	#new name
+	created_date=$(stat "$file_path" |
+			grep Modify | awk '{ print $2,$3}' |
+			sed 's/-/_/g' | sed 's/\s/_/' | sed 's/://g')
+	random_num="$(shuf -i 1-10000 -n 1)"
+	created_date_name="${created_date%.*}_$random_num$extension"
+}
+
+# gets all media file names in Internal storage
+media_dirs="DCIM Pictures Movies Download"
+media_files=()
+tmp_array=()
+
+for media_dir in $media_dirs
+do
+	tmp_array=("")
+	readarray -d '' tmp_array < <(find "$internal_storage/$media_dir" \
+					\( -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.mp4' \) -type f \
+					-not -path "*/$media_dir/.thumbnails/*" \
+					-print0)
+	for media_file in  "${tmp_array[@]}"
+	do
+		media_files+=("$media_file")
+	done
+done
+
+## asks user to continue
+echo -e "\n===== Allow system changes =====
+These files are going to be compressed and moved to $output_dir"
+for media_file in "${media_files[@]}"
+do
+	echo $media_file
+done
+read -p "Do you want to continue? [y/n] " action
+[ "$action" != "y" ] && rm -d -r "$tmp_dir" && exit 0
+
+
+# rename, compress, and move to output-dir on every media file
+success=0
+echo "========== MAIN PART ========="
+
+for media_file in "${media_files[@]}"
+do
+	# internal-storage  -->  get created-date name  --> tmp_dir  -->  ffmpeg  --> output_dir --> rm /tmp_dir media_file
+	length=${#media_files[@]}
+	echo -e "----------
+	\rWorking on: $media_file
+	"
+
+	to-created-date-name "$media_file"
+	if [ $? -eq 0 ]; then echo "new name: $created_date_name";
+	else echo "error: new name: $media_file"; continue; fi
+	tmp_file="$tmp_dir/$created_date_name"
+	output_file="$output_dir/$created_date_name"
+	
+	echo "Copying to $tmp_dir .... "
+	cp -f "$media_file" "$tmp_file"
+	if [ $? -eq 0 ]; then echo "Copied file to $tmp_file";
+	else echo "error: copy: $media_file"; continue; fi
+
+	# ffmpeg rendering
+	extension=".${media_file##*.}"
+	if [ "$extension" = ".mp4" ]
+	then
+		echo "Rendering $created_date_name... "
+		use-ffmpeg "$tmp_file" "$output_file"
+		if [ $? -eq 0 ]; then echo "Compressed and moved to $output_file";
+		else echo "error: ffmpeg: $media_file"; continue; fi
+	else
+		cp -f "$tmp_file" "$output_file"
+		if [ $? -eq 0 ]; then echo "Copied to $output_file)";
+		else echo "error: move: $media_file"; continue; fi
+	fi
+
+	rm "$tmp_file" "$media_file"
+	if [ $? -eq 0 ]; then echo "Removed files $media_file, $tmp_file)";
+	else echo "error: remove:  $media_file, $tmp_file"; continue; fi
+
+	success=$(( $success+1 ))
+	echo "Success: [$success/$length]: Successfully converted and moved $media_file"
+done
+
+# remove template files
+rm "$tmp_dir" -d -r
+echo "Thank you"
